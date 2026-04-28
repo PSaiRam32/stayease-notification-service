@@ -1,9 +1,22 @@
 server:
-  port: 8086
+  port: 8087
 
 spring:
   application:
-    name: payment-service
+    name: notification-service
+
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: sairam.paidipati32@gmail.com
+    password: oplj qscp xdst nwmk
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+#  twilio:
+#    account-sid: sid
+#    auth-token: token
+#    phone-number:phone
 
   datasource:
     url: jdbc:mysql://localhost:3306/stayease_notification_db
@@ -13,8 +26,8 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: update
-    show-sql: true
+      ddl-auto: create
+    show-sql: false
     properties:
       hibernate:
         format_sql: true

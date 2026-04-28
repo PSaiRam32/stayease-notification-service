@@ -1,19 +1,20 @@
 package com.stayease.notification_service.dto;
 
-import jakarta.validation.constraints.*;
-import lombok.Getter;
-import lombok.Setter;
+import lombok.*;
 
-
+@Data
 @Getter
 @Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class NotificationRequestDTO {
 
-    @NotNull
     private Long bookingId;
-    @NotBlank
-    private String userId;
+    private String email;
+    private String phoneNumber;
+    private String status; // BOOKING_CONFIRMED / PAYMENT_FAILED / BOOKING_CANCELLED
     private String type;
-    @NotBlank
     private String message;
+    private Long userId;
 }

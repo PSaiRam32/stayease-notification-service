@@ -7,26 +7,67 @@ import com.stayease.notification_service.entity.NotificationStatus;
 import com.stayease.notification_service.entity.NotificationType;
 import com.stayease.notification_service.exception.BusinessException;
 import com.stayease.notification_service.repository.NotificationRepository;
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.Executor;
 
 @Service
-@RequiredArgsConstructor
+@Slf4j
 public class NotificationServiceImpl implements NotificationService {
 
-    private final NotificationRepository notificationRepository;
+    @Value("${spring.mail.username}")
+    private String fromEmail;
     private static final int MAX_RETRY = 3;
+    private final NotificationRepository notificationRepository;
+    private final JavaMailSender mailSender;
+    private final Executor asyncExecutor;
+
+    public NotificationServiceImpl(
+            NotificationRepository notificationRepository,
+            JavaMailSender mailSender,
+            @Qualifier("notificationExecutor") Executor asyncExecutor
+    ) {
+        this.notificationRepository = notificationRepository;
+        this.mailSender = mailSender;
+        this.asyncExecutor = asyncExecutor;
+    }
 
     @Override
     public NotificationResponseDTO sendNotification(NotificationRequestDTO request) {
+        validateRequest(request);
+        NotificationType type = parseType(request.getType());
+        validateChannelSpecificFields(request, type);
+        Optional<Notification> existing = notificationRepository
+                .findByBookingIdAndTypeAndEventTypeAndStatus(
+                        request.getBookingId(),
+                        type,
+                        request.getStatus(),
+                        NotificationStatus.SENT
+                );
+        if (existing.isPresent()) {
+            log.warn("Duplicate notification skipped for bookingId={}", request.getBookingId());
+            return mapToDTO(existing.get());
+        }
+        Notification notification = createNotification(request, type);
+        asyncExecutor.execute(() -> processNotification(notification.getId()));
+
+        return mapToDTO(notification);
+    }
+    private void validateRequest(NotificationRequestDTO request) {
         if (request.getBookingId() == null) {
             throw new BusinessException("Booking ID is required");
         }
-        if (request.getUserId() == null || request.getUserId().isBlank()) {
+        if (request.getUserId() == null) {
             throw new BusinessException("User ID is required");
         }
         if (request.getMessage() == null || request.getMessage().isBlank()) {
@@ -35,94 +76,129 @@ public class NotificationServiceImpl implements NotificationService {
         if (request.getType() == null || request.getType().isBlank()) {
             throw new BusinessException("Notification type is required");
         }
+    }
 
-        // Parse type
-        NotificationType type;
+    private NotificationType parseType(String type) {
         try {
-            type = NotificationType.valueOf(request.getType().toUpperCase());
+            return NotificationType.valueOf(type.toUpperCase());
         } catch (Exception ex) {
             throw new BusinessException("Invalid notification type. Allowed: EMAIL, SMS");
         }
-
-        // Use shared logic
-        Notification notification = createAndProcess(request, type);
-        return mapToDTO(notification);
     }
 
-    // Public methods for direct email/SMS sending (forces type)
-    public void sendEmail(NotificationRequestDTO request) {
-        request.setType("EMAIL");  // Force type
-        createAndProcess(request, NotificationType.EMAIL);
+    private void validateChannelSpecificFields(NotificationRequestDTO request, NotificationType type) {
+
+        if (type == NotificationType.EMAIL &&
+                (request.getEmail() == null || request.getEmail().isBlank())) {
+            throw new BusinessException("Email is required for EMAIL notification");
+        }
     }
 
-    public void sendSMS(NotificationRequestDTO request) {
-        request.setType("SMS");  // Force type
-        createAndProcess(request, NotificationType.SMS);
-    }
-
-    // Shared method for creation and processing
-    private Notification createAndProcess(NotificationRequestDTO request, NotificationType type) {
+    private Notification createNotification(NotificationRequestDTO request, NotificationType type) {
         Notification notification = Notification.builder()
                 .bookingId(request.getBookingId())
-                .userId(request.getUserId())
+                .email(request.getEmail())
+                .phoneNumber(request.getPhoneNumber())
+                .userId(String.valueOf(request.getUserId()))
                 .type(type)
                 .message(request.getMessage())
+                .eventType(request.getStatus())
                 .status(NotificationStatus.PENDING)
                 .retryCount(0)
+                .nextRetryAt(LocalDateTime.now())
+                .createdAt(LocalDateTime.now())
                 .build();
-        notificationRepository.save(notification);
-        processNotification(notification);
-        return notification;
+        return notificationRepository.save(notification);
     }
 
-    // Process with retry logic
-    private void processNotification(Notification notification) {
+    @Transactional
+    public void processNotification(Long notificationId) {
+        Notification notification = notificationRepository.findById(notificationId)
+                .orElseThrow();
         try {
+            log.info("Processing notification ID={}, bookingId={}, userId={}, eventType={}",
+                    notification.getId(),
+                    notification.getBookingId(),
+                    notification.getUserId(),
+                    notification.getEventType());
             notification.setStatus(NotificationStatus.PROCESSING);
             notificationRepository.save(notification);
-
-            // Actual sending logic
             if (notification.getType() == NotificationType.EMAIL) {
-                sendEmail(notification);
-            } else if (notification.getType() == NotificationType.SMS) {
-                sendSMS(notification);
+                processEmail(notification);
             }
-
             notification.setStatus(NotificationStatus.SENT);
-        } catch (Exception ex) {
-            notification.setRetryCount(notification.getRetryCount() + 1);
-            if (notification.getRetryCount() >= MAX_RETRY) {
-                notification.setStatus(NotificationStatus.FAILED);
-            } else {
-                notification.setStatus(NotificationStatus.PENDING);
-            }
+        }catch (Exception ex) {
+        log.error("Notification failed ID={}, bookingId={}, eventType={}, retryCount={}",
+                notification.getId(),
+                notification.getBookingId(),
+                notification.getEventType(),
+                notification.getRetryCount(),
+                ex);
+        int retryCount = notification.getRetryCount() + 1;
+        notification.setRetryCount(retryCount);
+        if (retryCount >= MAX_RETRY) {
+            notification.setStatus(NotificationStatus.FAILED);
+        } else {
+            notification.setStatus(NotificationStatus.PENDING);
+            long delaySeconds = (long) Math.pow(2, retryCount) * 30;
+            notification.setNextRetryAt(
+                    LocalDateTime.now().plusSeconds(delaySeconds)
+            );
+            log.warn("Retry scheduled for notificationId={} after {} seconds",
+                    notification.getId(), delaySeconds);
         }
+    }
         notification.setUpdatedAt(LocalDateTime.now());
         notificationRepository.save(notification);
     }
 
-    // Placeholder for actual email sending (integrate with Spring Mail or similar)
-    private void sendEmail(Notification notification) {
-        // Example: Use JavaMailSender or external service
-        // throw new RuntimeException("Email send failed"); // For testing failures
-        // For now, assume success
+    private void processEmail(Notification notification) {
+        SimpleMailMessage mail = new SimpleMailMessage();
+        mail.setFrom(fromEmail);
+        mail.setTo(notification.getEmail());
+        mail.setSubject(buildSubject(notification));
+        mail.setText(notification.getMessage());
+        mailSender.send(mail);
+        log.info("Email sent successfully for bookingId={}, eventType={}",
+                notification.getBookingId(),
+                notification.getEventType());
     }
 
-    // Placeholder for actual SMS sending (integrate with Twilio or similar)
-    private void sendSMS(Notification notification) {
-        // Example: Use SMS API
-        // throw new RuntimeException("SMS send failed"); // For testing failures
-        // For now, assume success
+    private String buildSubject(Notification notification) {
+        String event = notification.getEventType();
+        if (event == null) {
+            return "StayEase Notification";
+        }
+        switch (event) {
+            case "CONFIRMED":
+                return "Your Booking is Confirmed - StayEase";
+            case "CANCELLED":
+                return "Your Booking has been Cancelled - StayEase";
+            case "FAILED":
+                return "Payment Failed for Your Booking - StayEase";
+            default:
+                return "StayEase Booking Update";
+        }
     }
 
-    // Scheduled retry for pending notifications
-    @Scheduled(fixedRate = 60000)  // Every 60 seconds
+
+
+//    S6Q5BEGMPKV84JFVN31YPH6F
+    @Scheduled(fixedRate = 60000) // every 60 sec
     public void retryFailedNotifications() {
-        List<Notification> pendingList = notificationRepository.findByStatus(NotificationStatus.PENDING);
-        pendingList.forEach(this::processNotification);
+        List<Notification> pendingList =
+                notificationRepository
+                        .findByStatusAndRetryCountLessThanAndNextRetryAtBefore(
+                                NotificationStatus.PENDING,
+                                MAX_RETRY,
+                                LocalDateTime.now()
+                        );
+        log.info("Retry scheduler triggered. Eligible notifications count={}", pendingList.size());
+        pendingList.forEach(n ->
+                asyncExecutor.execute(() -> processNotification(n.getId()))
+        );
     }
 
-    // Map to DTO
     private NotificationResponseDTO mapToDTO(Notification notification) {
         return NotificationResponseDTO.builder()
                 .id(notification.getId())

@@ -1,12 +1,12 @@
 package com.stayease.notification_service.dto;
 
-import lombok.*;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
-@Getter
-@Setter
+@Data
 @AllArgsConstructor
 @NoArgsConstructor
-@Builder
 public class ApiResponse<T> {
     private String status;
     private String message;
